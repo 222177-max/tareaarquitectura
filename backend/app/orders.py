@@ -1,6 +1,6 @@
+
 from __future__ import annotations
 
-import asyncio
 import hashlib
 import json
 import uuid
@@ -38,7 +38,9 @@ def _canonical_request_hash(payload: OrderCreate) -> str:
 
 
 def _advisory_lock_key(dataset_id: str, idempotency_key: str) -> int:
-    digest = hashlib.sha256(f"{dataset_id}:{idempotency_key}".encode("utf-8")).digest()
+    digest = hashlib.sha256(
+        f"{dataset_id}:{idempotency_key}".encode("utf-8")
+    ).digest()
     return int.from_bytes(digest[:8], "big", signed=True)
 
 
@@ -50,6 +52,7 @@ async def _create_or_replay(
     payload: OrderCreate,
 ) -> dict[str, Any]:
     lock_key = _advisory_lock_key(dataset_id, idempotency_key)
+
     async with session.begin():
         await session.execute(
             text("SELECT pg_advisory_xact_lock(:lock_key)"),
@@ -64,6 +67,7 @@ async def _create_or_replay(
                 )
             )
         ).scalar_one_or_none()
+
         if existing is not None:
             if existing.request_hash != request_hash:
                 raise ApiError(
@@ -74,6 +78,7 @@ async def _create_or_replay(
             return dict(existing.snapshot)
 
         identifiers = [item.product_id for item in payload.items]
+
         products = (
             await session.execute(
                 select(Product).where(
@@ -82,9 +87,15 @@ async def _create_or_replay(
                 )
             )
         ).scalars().all()
+
         products_by_id = {product.id: product for product in products}
 
-        missing = sorted(identifier for identifier in identifiers if identifier not in products_by_id)
+        missing = sorted(
+            identifier
+            for identifier in identifiers
+            if identifier not in products_by_id
+        )
+
         if missing:
             raise ApiError(
                 404,
@@ -93,9 +104,14 @@ async def _create_or_replay(
                 {"product_ids": missing},
             )
 
-        quantities = {item.product_id: item.quantity for item in payload.items}
+        quantities = {
+            item.product_id: item.quantity
+            for item in payload.items
+        }
+
         for product_id in sorted(quantities):
             quantity = quantities[product_id]
+
             result = await session.execute(
                 update(Product)
                 .where(
@@ -106,6 +122,7 @@ async def _create_or_replay(
                 .values(stock=Product.stock - quantity)
                 .returning(Product.stock)
             )
+
             if result.first() is None:
                 raise ApiError(
                     409,
@@ -116,6 +133,7 @@ async def _create_or_replay(
 
         created_at = utcnow()
         order_id = uuid.uuid4()
+
         items_out = [
             {
                 "product_id": item.product_id,
@@ -125,7 +143,12 @@ async def _create_or_replay(
             }
             for item in payload.items
         ]
-        total_cents = sum(item["unit_price_cents"] * item["quantity"] for item in items_out)
+
+        total_cents = sum(
+            item["unit_price_cents"] * item["quantity"]
+            for item in items_out
+        )
+
         snapshot = {
             "id": str(order_id),
             "status": "confirmed",
@@ -146,6 +169,7 @@ async def _create_or_replay(
             created_at=created_at,
             snapshot=snapshot,
         )
+
         session.add(order)
 
         for item in items_out:
@@ -159,14 +183,21 @@ async def _create_or_replay(
                 )
             )
 
+        # Construir el evento CloudEvents con el total del pedido.
         event_payload = build_order_created_event(
             order_id,
             [
-                {"product_id": item.product_id, "quantity": item.quantity}
+                {
+                    "product_id": item.product_id,
+                    "quantity": item.quantity,
+                }
                 for item in payload.items
             ],
             created_at,
+            total_cents,
         )
+
+        # Guardar el evento pendiente en la misma transacción.
         session.add(
             Outbox(
                 event_id=uuid.UUID(event_payload["id"]),
@@ -179,12 +210,8 @@ async def _create_or_replay(
         )
 
         await session.flush()
+
         return snapshot
-
-
-async def _confirmation_lead(delay_ms: int) -> None:
-    if delay_ms > 0:
-        await asyncio.sleep(delay_ms / 1000)
 
 
 @router.get("/api/v1/products")
@@ -193,6 +220,7 @@ async def list_products(
     session: AsyncSession = Depends(get_session),
     context: DatasetContext = Depends(dataset_context),
 ) -> dict[str, Any]:
+
     products = (
         await session.execute(
             select(Product)
@@ -228,10 +256,15 @@ async def create_order(
     request: Request,
     session: AsyncSession = Depends(get_session),
     context: DatasetContext = Depends(dataset_context),
-    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+    idempotency_key: str | None = Header(
+        default=None,
+        alias="Idempotency-Key",
+    ),
 ) -> JSONResponse:
+
     key = validate_idempotency_key(idempotency_key)
     request_hash = _canonical_request_hash(payload)
+
     snapshot = await _create_or_replay(
         session,
         context.dataset_id,
@@ -239,7 +272,8 @@ async def create_order(
         request_hash,
         payload,
     )
-    await _confirmation_lead(context.notification_delay_ms)
+
+    # La confirmación HTTP no espera a que se envíe la notificación.
     return JSONResponse(
         status_code=201,
         content=snapshot,
@@ -254,15 +288,18 @@ async def get_order(
     session: AsyncSession = Depends(get_session),
     context: DatasetContext = Depends(dataset_context),
 ) -> JSONResponse:
+
     try:
         identifier = uuid.UUID(order_id)
     except (ValueError, AttributeError, TypeError):
         raise ApiError(404, "NOT_FOUND", "Order not found") from None
 
     order = await session.get(Order, identifier)
+
     if order is None or order.dataset_id != context.dataset_id:
         raise ApiError(404, "NOT_FOUND", "Order not found")
 
     snapshot = dict(order.snapshot)
     snapshot["notification_status"] = order.notification_status
+
     return JSONResponse(content=snapshot)
